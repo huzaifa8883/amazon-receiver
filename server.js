@@ -6,7 +6,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { startSignalWorker } from './src/signal_worker.js';
+import {
+  startSignalWorker
+} from './src/signal_worker.js';
 
 import {
   validateOracleSignal,
@@ -19,10 +21,14 @@ import {
   rankShifts
 } from './src/rules.js';
 
-const dir = path.dirname(fileURLToPath(import.meta.url));
+const dir = path.dirname(
+  fileURLToPath(import.meta.url)
+);
+
 const env = process.env;
 
-const id = env.RECEIVER_ID || 'receiver-01';
+const id =
+  env.RECEIVER_ID || 'receiver-01';
 
 const keys = path.resolve(
   dir,
@@ -44,7 +50,10 @@ const credential = fs.readFileSync(
   'utf8'
 ).trim();
 
-const stateDir = path.join(dir, '.runtime');
+const stateDir = path.join(
+  dir,
+  '.runtime'
+);
 
 fs.mkdirSync(stateDir, {
   recursive: true,
@@ -67,7 +76,10 @@ try {
   store = {
     ...store,
     ...JSON.parse(
-      fs.readFileSync(stateFile, 'utf8')
+      fs.readFileSync(
+        stateFile,
+        'utf8'
+      )
     )
   };
 } catch {}
@@ -102,26 +114,41 @@ let busy = false;
 let activeSignal = null;
 let lastSnapshot = null;
 
+// Receiver job and shift settings
 const options = {
   ...DEFAULTS,
-  maxMiles: Number(env.MAX_MILES || 10),
+
+  maxMiles: Number(
+    env.MAX_MILES || 10
+  ),
+
   box1: {
-    keywords: (env.KEYWORDS || '')
+    keywords: (
+      env.KEYWORDS || ''
+    )
       .split(',')
       .map(s => s.trim())
       .filter(Boolean),
+
     mode: 'priority'
   },
+
   shifts: {
     ...DEFAULTS.shifts,
-    minHours: env.MIN_SHIFT_HOURS || null,
-    maxHours: env.MAX_SHIFT_HOURS || null,
+
+    minHours:
+      env.MIN_SHIFT_HOURS || null,
+
+    maxHours:
+      env.MAX_SHIFT_HOURS || null,
+
     days: env.SHIFT_DAYS
       ? Number(env.SHIFT_DAYS)
       : 5
   }
 };
 
+// Local audit records
 function audit(action, details = {}) {
   store.audit.push({
     action,
@@ -134,14 +161,18 @@ function audit(action, details = {}) {
   save();
 }
 
+// Persist incoming Oracle signals
 function persistSignal(signal) {
-  const valid = validateOracleSignal(signal);
+  const valid =
+    validateOracleSignal(signal);
 
   if (!valid) {
     return { ok: false };
   }
 
-  store.seen = trimSeenSignals(store.seen);
+  store.seen = trimSeenSignals(
+    store.seen
+  );
 
   if (
     store.seen.some(
@@ -168,6 +199,7 @@ function persistSignal(signal) {
     at: Date.now()
   });
 
+  // ACK after persistent storage
   save();
 
   state.lastSignal = {
@@ -184,6 +216,7 @@ function persistSignal(signal) {
   return { ok: true };
 }
 
+// Node-to-browser adapter messaging
 async function message(message) {
   return page.evaluate(
     m =>
@@ -219,6 +252,7 @@ async function message(message) {
   );
 }
 
+// Click through existing adapter
 async function click(id, label) {
   if (!id) return false;
 
@@ -238,16 +272,29 @@ async function click(id, label) {
   return r?.ok === true;
 }
 
+// Process Amazon page observations
 async function onSnapshot(snapshot) {
   lastSnapshot = snapshot;
 
   state.lastSnapshot = {
-    isSearch: snapshot.isSearch,
-    jobCards: snapshot.jobCards?.length,
-    shiftCards: snapshot.shiftCards?.length,
-    securityBlocked: snapshot.securityBlocked,
-    loginRequired: snapshot.loginRequired,
-    publicJobSearch: snapshot.publicJobSearch,
+    isSearch:
+      snapshot.isSearch,
+
+    jobCards:
+      snapshot.jobCards?.length,
+
+    shiftCards:
+      snapshot.shiftCards?.length,
+
+    securityBlocked:
+      snapshot.securityBlocked,
+
+    loginRequired:
+      snapshot.loginRequired,
+
+    publicJobSearch:
+      snapshot.publicJobSearch,
+
     at: new Date().toISOString()
   };
 
@@ -255,22 +302,33 @@ async function onSnapshot(snapshot) {
     snapshot.securityBlocked ||
     snapshot.loginRequired
   ) {
-    state.phase = 'paused_human_action';
+    state.phase =
+      'paused_human_action';
 
-    audit('manual_intervention_required', {
-      security: snapshot.securityBlocked,
-      login: snapshot.loginRequired
-    });
+    audit(
+      'manual_intervention_required',
+      {
+        security:
+          snapshot.securityBlocked,
+
+        login:
+          snapshot.loginRequired
+      }
+    );
 
     return;
   }
 
   if (!activeSignal) return;
 
+  // Job search results
   if (snapshot.isSearch) {
     state.phase = 'search_results';
 
-    if (env.AUTO_SELECT_JOB !== 'true') {
+    if (
+      !env.AUTO_SELECT_JOB ||
+      env.AUTO_SELECT_JOB !== 'true'
+    ) {
       return;
     }
 
@@ -306,10 +364,15 @@ async function onSnapshot(snapshot) {
         key: match.key
       });
     }
-  } else if (snapshot.step2) {
+  }
+
+  // Shift selection screen
+  else if (snapshot.step2) {
     state.phase = 'shift_selection';
 
-    if (env.AUTO_SELECT_SHIFT !== 'true') {
+    if (
+      env.AUTO_SELECT_SHIFT !== 'true'
+    ) {
       return;
     }
 
@@ -333,7 +396,10 @@ async function onSnapshot(snapshot) {
           'manual_completion_required';
       }
     }
-  } else if (
+  }
+
+  // Application / prehire screens
+  else if (
     snapshot.prehire ||
     snapshot.buttons?.acceptOffer ||
     snapshot.buttons?.start ||
@@ -342,8 +408,13 @@ async function onSnapshot(snapshot) {
     state.phase =
       'manual_completion_required';
 
-    audit('application_requires_review');
-  } else if (
+    audit(
+      'application_requires_review'
+    );
+  }
+
+  // No available shifts
+  else if (
     snapshot.noShifts ||
     snapshot.noShiftPage
   ) {
@@ -355,9 +426,12 @@ async function onSnapshot(snapshot) {
   }
 }
 
+// Handle messages from Playwright page
 async function onPageMessage(msg) {
   if (msg?.type === 'OBSERVATION') {
-    await onSnapshot(msg.snapshot);
+    await onSnapshot(
+      msg.snapshot
+    );
 
     return { ok: true };
   }
@@ -369,9 +443,11 @@ async function onPageMessage(msg) {
   return { ok: true };
 }
 
+// Navigate to Amazon job search page
 async function navigate() {
   await page.goto(
-    env.SEARCH_URL || DEFAULTS.searchUrl,
+    env.SEARCH_URL ||
+      DEFAULTS.searchUrl,
     {
       waitUntil: 'domcontentloaded',
       timeout: 30000
@@ -391,6 +467,7 @@ async function navigate() {
   });
 }
 
+// Process next queued signal
 async function processNext() {
   if (
     busy ||
@@ -404,11 +481,13 @@ async function processNext() {
   busy = true;
 
   try {
-    activeSignal = store.pending.shift();
+    activeSignal =
+      store.pending.shift();
 
     save();
 
-    state.phase = 'processing_signal';
+    state.phase =
+      'processing_signal';
 
     audit('signal_processing', {
       id: activeSignal.event_id
@@ -428,8 +507,13 @@ async function processNext() {
   }
 }
 
-const port = Number(env.PORT || 5003);
-const host = env.BIND_HOST || '127.0.0.1';
+// Health server
+const port = Number(
+  env.PORT || 5003
+);
+
+const host =
+  env.BIND_HOST || '127.0.0.1';
 
 const server = http.createServer(
   (req, res) => {
@@ -456,6 +540,7 @@ const server = http.createServer(
   }
 );
 
+// Main Playwright startup
 async function main() {
   const userDataDir = path.resolve(
     dir,
@@ -473,13 +558,37 @@ async function main() {
     userDataDir,
     {
       headless: env.HEADLESS === 'true',
-      args:
-        env.CHROMIUM_NO_SANDBOX === 'true'
-          ? ['--no-sandbox']
-          : [],
+
       ...(env.CHROME_CHANNEL
         ? { channel: env.CHROME_CHANNEL }
-        : {})
+        : {}),
+
+      viewport: {
+        width: 1920,
+        height: 1080
+      },
+
+      screen: {
+        width: 1920,
+        height: 1080
+      },
+
+      locale: 'en-GB',
+
+      timezoneId: 'Europe/London',
+
+      acceptDownloads: false,
+
+      args: [
+        '--window-size=1920,1080',
+
+        ...(env.CHROMIUM_NO_SANDBOX === 'true'
+          ? [
+              '--no-sandbox',
+              '--disable-setuid-sandbox'
+            ]
+          : [])
+      ]
     }
   );
 
@@ -492,12 +601,15 @@ async function main() {
     (_, msg) => onPageMessage(msg)
   );
 
+  // Chrome extension compatibility bridge
   await browser.addInitScript(() => {
     globalThis.chrome = {
       runtime: {
         id: 'node-receiver',
+
         sendMessage: m =>
           globalThis.__nodeReceiverMessage(m),
+
         onMessage: {
           addListener(cb) {
             globalThis.__receiverAdapterListener = cb;
@@ -511,15 +623,20 @@ async function main() {
 
   state.browser = 'running';
 
+  // Connect Oracle WebSocket receiver
   worker = startSignalWorker({
     config: {
       endpoint:
         env.ORACLE_WS_URL ||
         'wss://145-241-233-33.sslip.io/v1/receivers/ws',
+
       receiverId: id,
+
       credential
     },
+
     persistSignal,
+
     onStatus: s => {
       state.socket = s.state;
 
@@ -532,6 +649,7 @@ async function main() {
   processNext();
 }
 
+// Start HTTP server
 server.listen(port, host, () => {
   console.log(
     `Receiver health http://${host}:${port}/health`
@@ -540,16 +658,20 @@ server.listen(port, host, () => {
 
 main().catch(e => {
   state.lastError = e.message;
+
   console.error(e);
   process.exitCode = 1;
 });
 
+// Graceful shutdown
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, async () => {
     worker?.stop();
     save();
     server.close();
+
     await browser?.close();
+
     process.exit(0);
   });
 }
