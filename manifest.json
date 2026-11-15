@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Amazon Jobs \u2013 Full Apply Assistant",
+  "version": "1.4.3",
+  "description": "Amazon Jobs assistant with Oracle receiver signal ACKs, instant signal-based refresh, local availability audit, Telegram reports and built-in refresh.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms",
+    "offscreen",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "https://145-241-233-33.sslip.io/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Amazon Jobs Assistant"
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
