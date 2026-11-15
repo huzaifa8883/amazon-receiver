@@ -1,3 +1,4 @@
+import NodeWebSocket from 'ws';
 /* Production Oracle Stage 3/5E WebSocket protocol, read from receiver_api.py
    and receiver_store.py. Credentials are sent only in the authenticated WSS
    first frame; never put secrets in a URL or a source ZIP. */
@@ -7,7 +8,7 @@ export const receiverAuthMessage = ({receiverId,credential}) => ({
   type:'authenticate', receiver_id:receiverId, token:credential
 });
 
-export function createSignalSocket({WebSocketClass=WebSocket,clock=()=>Date.now(),random=Math.random,
+export function createSignalSocket({WebSocketClass=(typeof WebSocket!=='undefined'?WebSocket:NodeWebSocket),clock=()=>Date.now(),random=Math.random,
   sendStatus=()=>{},sendSignal=()=>{},schedule=setTimeout,cancel=clearTimeout}={}){
   let ws=null,desired=null,reconnectTimer=null,authenticated=false,attempt=0,serial=0,lastAck=null;
   const emit=(state,error='')=>sendStatus({state,error,receiverId:desired?.receiverId||'',connected:state==='connected',at:clock(),lastAck});
@@ -97,7 +98,7 @@ export function createSignalSocket({WebSocketClass=WebSocket,clock=()=>Date.now(
 
 /* Connection test is read-only: authenticate and close without processing a job
    signal or changing the active automation controller. */
-export function testSignalConnection(c,{WebSocketClass=WebSocket,schedule=setTimeout,cancel=clearTimeout,timeoutMs=8000}={}){
+export function testSignalConnection(c,{WebSocketClass=(typeof WebSocket!=='undefined'?WebSocket:NodeWebSocket),schedule=setTimeout,cancel=clearTimeout,timeoutMs=8000}={}){
   const error=validateReceiverConfig(c);
   if(error)return Promise.resolve({ok:false,error});
   return new Promise(resolve=>{
