@@ -1,677 +1,333 @@
 
 import 'dotenv/config';
-import { chromium } from 'playwright';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import {
-  startSignalWorker
-} from './src/signal_worker.js';
-
-import {
-  validateOracleSignal,
-  trimSeenSignals
-} from './src/signal_rules.js';
-
-import {
-  DEFAULTS,
-  rankJobs,
-  rankShifts
-} from './src/rules.js';
-
-const dir = path.dirname(
-  fileURLToPath(import.meta.url)
-);
-
+const dir = path.dirname(fileURLToPath(import.meta.url));
 const env = process.env;
 
-const id =
-  env.RECEIVER_ID || 'receiver-01';
+const PORT = Number(env.PORT || 5003);
+const HOST = env.BIND_HOST || '127.0.0.1';
 
-const keys = path.resolve(
-  dir,
-  env.KEYS_DIR || '../AmazonJobsKeys'
+const DETECTOR_URL = (
+  env.DETECTOR_URL || 'http://127.0.0.1:5002'
+).replace(/\/$/, '');
+
+const POLL_INTERVAL = Math.max(
+  60000,
+  Number(env.POLL_INTERVAL_MS || 90000)
 );
 
-if (!/^receiver-0[1-5]$/.test(id)) {
-  throw Error(
-    'Receiver ID must be receiver-01 through receiver-05'
-  );
-}
+const DATA_DIR = path.join(dir, '.runtime');
+const DATA_FILE = path.join(DATA_DIR, 'public-receiver.json');
 
-const credential = fs.readFileSync(
-  path.join(
-    keys,
-    'receiver-keys',
-    `${id}.key`
-  ),
-  'utf8'
-).trim();
-
-const stateDir = path.join(
-  dir,
-  '.runtime'
-);
-
-fs.mkdirSync(stateDir, {
+fs.mkdirSync(DATA_DIR, {
   recursive: true,
   mode: 0o700
 });
 
-const stateFile = path.join(
-  stateDir,
-  `${id}.json`
-);
-
 let store = {
-  pending: [],
   seen: [],
-  completed: [],
-  audit: []
+  pending: [],
+  history: []
 };
 
 try {
   store = {
     ...store,
-    ...JSON.parse(
-      fs.readFileSync(
-        stateFile,
-        'utf8'
-      )
-    )
+    ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'))
   };
-} catch {}
-
-function save() {
-  const t = stateFile + '.tmp';
-
-  fs.writeFileSync(
-    t,
-    JSON.stringify(store),
-    { mode: 0o600 }
-  );
-
-  fs.renameSync(t, stateFile);
+} catch (error) {
+  if (error.code !== 'ENOENT') {
+    console.error('State load failed:', error.message);
+  }
 }
 
 const state = {
-  id,
-  browser: 'starting',
-  socket: 'not_started',
-  phase: 'idle',
-  lastSignal: null,
+  service: 'amazon-receiver',
+  startedAt: new Date().toISOString(),
+  phase: 'starting',
+  detector: 'unknown',
+  lastPoll: null,
   lastError: null,
-  lastSnapshot: null,
-  lastAction: null
+  lastNewJobs: 0,
+  lastJob: null,
+  nextPoll: null
 };
 
-let browser;
-let page;
-let worker;
+let timer;
+let stopping = false;
 let busy = false;
-let activeSignal = null;
-let lastSnapshot = null;
 
-// Receiver job and shift settings
-const options = {
-  ...DEFAULTS,
-
-  maxMiles: Number(
-    env.MAX_MILES || 10
-  ),
-
-  box1: {
-    keywords: (
-      env.KEYWORDS || ''
-    )
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean),
-
-    mode: 'priority'
-  },
-
-  shifts: {
-    ...DEFAULTS.shifts,
-
-    minHours:
-      env.MIN_SHIFT_HOURS || null,
-
-    maxHours:
-      env.MAX_SHIFT_HOURS || null,
-
-    days: env.SHIFT_DAYS
-      ? Number(env.SHIFT_DAYS)
-      : 5
-  }
-};
-
-// Local audit records
-function audit(action, details = {}) {
-  store.audit.push({
-    action,
-    details,
-    at: new Date().toISOString()
-  });
-
-  store.audit = store.audit.slice(-300);
-
-  save();
+function log(event, details = {}) {
+  console.log(JSON.stringify({
+    time: new Date().toISOString(),
+    service: 'receiver',
+    event,
+    ...details
+  }));
 }
 
-// Persist incoming Oracle signals
-function persistSignal(signal) {
-  const valid =
-    validateOracleSignal(signal);
+function save() {
+  const temp = DATA_FILE + '.tmp';
 
-  if (!valid) {
-    return { ok: false };
-  }
-
-  store.seen = trimSeenSignals(
-    store.seen
+  fs.writeFileSync(
+    temp,
+    JSON.stringify(store, null, 2),
+    { mode: 0o600 }
   );
 
-  if (
-    store.seen.some(
-      x => x.id === valid.event_id
-    )
-  ) {
-    return {
-      ok: true,
-      duplicate: true
-    };
-  }
-
-  if (store.pending.length >= 40) {
-    return {
-      ok: false,
-      error: 'Queue full'
-    };
-  }
-
-  store.pending.push(valid);
-
-  store.seen.push({
-    id: valid.event_id,
-    at: Date.now()
-  });
-
-  // ACK after persistent storage
-  save();
-
-  state.lastSignal = {
-    id: valid.event_id,
-    jobId: valid.job_id
-  };
-
-  audit('signal_durably_queued', {
-    signalId: valid.event_id
-  });
-
-  queueMicrotask(processNext);
-
-  return { ok: true };
+  fs.renameSync(temp, DATA_FILE);
 }
 
-// Node-to-browser adapter messaging
-async function message(message) {
-  return page.evaluate(
-    m =>
-      new Promise((resolve, reject) => {
-        const cb =
-          globalThis.__receiverAdapterListener;
-
-        if (!cb) {
-          return reject(
-            Error('Adapter unavailable')
-          );
-        }
-
-        let done = false;
-
-        cb(m, null, r => {
-          if (!done) {
-            done = true;
-            resolve(r);
-          }
-        });
-
-        setTimeout(() => {
-          if (!done) {
-            done = true;
-            reject(
-              Error('Adapter reply timeout')
-            );
-          }
-        }, 5000);
-      }),
-    message
+function jobKey(job) {
+  return String(
+    job.jobId ||
+    job.url ||
+    `${job.title}|${job.location}`
   );
 }
 
-// Click through existing adapter
-async function click(id, label) {
-  if (!id) return false;
+function matchesFilters(job) {
+  const keywords = (env.KEYWORDS || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
 
-  const r = await message({
-    type: 'CLICK',
-    generation: 1,
-    id,
-    label: label || ''
-  });
+  if (!keywords.length) return true;
 
-  state.lastAction = {
-    id,
-    ok: r?.ok,
-    at: new Date().toISOString()
-  };
+  const searchable = [
+    job.title,
+    job.location
+  ].join(' ').toLowerCase();
 
-  return r?.ok === true;
+  return keywords.some(word =>
+    searchable.includes(word)
+  );
 }
 
-// Process Amazon page observations
-async function onSnapshot(snapshot) {
-  lastSnapshot = snapshot;
-
-  state.lastSnapshot = {
-    isSearch:
-      snapshot.isSearch,
-
-    jobCards:
-      snapshot.jobCards?.length,
-
-    shiftCards:
-      snapshot.shiftCards?.length,
-
-    securityBlocked:
-      snapshot.securityBlocked,
-
-    loginRequired:
-      snapshot.loginRequired,
-
-    publicJobSearch:
-      snapshot.publicJobSearch,
-
-    at: new Date().toISOString()
-  };
-
-  if (
-    snapshot.securityBlocked ||
-    snapshot.loginRequired
-  ) {
-    state.phase =
-      'paused_human_action';
-
-    audit(
-      'manual_intervention_required',
-      {
-        security:
-          snapshot.securityBlocked,
-
-        login:
-          snapshot.loginRequired
-      }
-    );
-
-    return;
-  }
-
-  if (!activeSignal) return;
-
-  // Job search results
-  if (snapshot.isSearch) {
-    state.phase = 'search_results';
-
-    if (
-      !env.AUTO_SELECT_JOB ||
-      env.AUTO_SELECT_JOB !== 'true'
-    ) {
-      return;
-    }
-
-    const ranked = rankJobs(
-      snapshot.jobCards || [],
-      options
-    ).filter(
-      c =>
-        c.key &&
-        !store.completed.includes(c.key)
-    );
-
-    const wanted =
-      activeSignal.job_id?.toLowerCase();
-
-    const match = ranked.find(
-      c =>
-        wanted &&
-        c.key.toLowerCase().includes(wanted)
-    );
-
-    if (!match) return;
-
-    state.phase = 'selecting_job';
-
-    if (
-      await click(
-        match.id,
-        match.title
-      )
-    ) {
-      audit('job_selected', {
-        key: match.key
-      });
-    }
-  }
-
-  // Shift selection screen
-  else if (snapshot.step2) {
-    state.phase = 'shift_selection';
-
-    if (
-      env.AUTO_SELECT_SHIFT !== 'true'
-    ) {
-      return;
-    }
-
-    const ranked = rankShifts(
-      snapshot.shiftCards || [],
-      options.shifts
-    );
-
-    if (ranked.length) {
-      if (
-        await click(
-          ranked[0].id,
-          ranked[0].text?.slice(0, 80)
-        )
-      ) {
-        audit('shift_selected', {
-          key: ranked[0].key
-        });
-
-        state.phase =
-          'manual_completion_required';
-      }
-    }
-  }
-
-  // Application / prehire screens
-  else if (
-    snapshot.prehire ||
-    snapshot.buttons?.acceptOffer ||
-    snapshot.buttons?.start ||
-    snapshot.buttons?.agree
-  ) {
-    state.phase =
-      'manual_completion_required';
-
-    audit(
-      'application_requires_review'
-    );
-  }
-
-  // No available shifts
-  else if (
-    snapshot.noShifts ||
-    snapshot.noShiftPage
-  ) {
-    state.phase = 'no_shifts';
-
-    activeSignal = null;
-
-    queueMicrotask(processNext);
-  }
-}
-
-// Handle messages from Playwright page
-async function onPageMessage(msg) {
-  if (msg?.type === 'OBSERVATION') {
-    await onSnapshot(
-      msg.snapshot
-    );
-
-    return { ok: true };
-  }
-
-  if (msg?.type === 'WATCH_TICK') {
-    return { ok: true };
-  }
-
-  return { ok: true };
-}
-
-// Navigate to Amazon job search page
-async function navigate() {
-  await page.goto(
-    env.SEARCH_URL ||
-      DEFAULTS.searchUrl,
-    {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000
-    }
+async function fetchJSON(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    10000
   );
 
-  await page.addScriptTag({
-    path: path.join(
-      dir,
-      'src/adapter.js'
-    )
-  });
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json'
+      },
+      signal: controller.signal
+    });
 
-  await message({
-    type: 'ENABLE',
-    generation: 1
-  });
+    if (!response.ok) {
+      throw new Error(
+        `Detector HTTP ${response.status}`
+      );
+    }
+
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-// Process next queued signal
-async function processNext() {
-  if (
-    busy ||
-    !page ||
-    activeSignal ||
-    !store.pending.length
-  ) {
-    return;
-  }
+function processJob(job) {
+  const key = jobKey(job);
+
+  if (!key || key === 'undefined') return false;
+  if (store.seen.includes(key)) return false;
+
+  store.seen.push(key);
+
+  if (!matchesFilters(job)) return false;
+
+  const record = {
+    ...job,
+    receiverDetectedAt: new Date().toISOString(),
+    status: 'new'
+  };
+
+  store.pending.push(record);
+  store.history.push({
+    key,
+    action: 'public_job_discovered',
+    at: record.receiverDetectedAt
+  });
+
+  state.lastJob = {
+    jobId: record.jobId,
+    title: record.title,
+    location: record.location
+  };
+
+  log('new_public_job', {
+    jobId: record.jobId,
+    title: record.title,
+    location: record.location,
+    url: record.url
+  });
+
+  return true;
+}
+
+async function pollDetector() {
+  if (stopping || busy) return;
 
   busy = true;
 
   try {
-    activeSignal =
-      store.pending.shift();
+    const health = await fetchJSON(
+      `${DETECTOR_URL}/health`
+    );
 
-    save();
+    state.detector = health.browser;
 
-    state.phase =
-      'processing_signal';
-
-    audit('signal_processing', {
-      id: activeSignal.event_id
-    });
-
-    await navigate();
-
-    await message({
-      type: 'SCAN'
-    });
-  } catch (e) {
-    state.lastError = e.message;
-    state.phase = 'error';
-    activeSignal = null;
-  } finally {
-    busy = false;
-  }
-}
-
-// Health server
-const port = Number(
-  env.PORT || 5003
-);
-
-const host =
-  env.BIND_HOST || '127.0.0.1';
-
-const server = http.createServer(
-  (req, res) => {
     if (
-      !['/health', '/status'].includes(
-        req.url
-      )
+      health.paused ||
+      health.security === 'access_restricted'
     ) {
-      res.writeHead(404).end();
+      state.phase = 'paused_detector_restricted';
+      state.lastError = 'Detector access restricted';
+
+      log('detector_restricted');
       return;
     }
 
-    res.writeHead(200, {
-      'content-type': 'application/json',
-      'cache-control': 'no-store'
-    }).end(
-      JSON.stringify({
-        ...state,
-        queue: store.pending.length,
-        activeSignal:
-          activeSignal?.event_id || null
-      })
+    if (!health.lastScan) {
+      state.phase = 'waiting_for_detector';
+      return;
+    }
+
+    const result = await fetchJSON(
+      `${DETECTOR_URL}/jobs?limit=500`
     );
+
+    const incoming = Array.isArray(result.jobs)
+      ? result.jobs
+      : [];
+
+    let added = 0;
+
+    for (const job of incoming) {
+      if (processJob(job)) added++;
+    }
+
+    // Keep state files bounded.
+    store.seen = store.seen.slice(-10000);
+    store.pending = store.pending.slice(-2000);
+    store.history = store.history.slice(-2000);
+
+    save();
+
+    state.phase = 'monitoring';
+    state.lastPoll = new Date().toISOString();
+    state.lastNewJobs = added;
+    state.lastError = null;
+
+    log('poll_completed', {
+      received: incoming.length,
+      added,
+      pending: store.pending.length
+    });
+
+  } catch (error) {
+    state.phase = 'error';
+    state.detector = 'unavailable';
+    state.lastError = error.message;
+
+    log('poll_failed', {
+      error: error.message
+    });
+
+  } finally {
+    busy = false;
+    scheduleNext();
   }
-);
-
-// Main Playwright startup
-async function main() {
-  const userDataDir = path.resolve(
-    dir,
-    env.PROFILE_DIR || '.browser-profile'
-  );
-
-  fs.mkdirSync(userDataDir, {
-    recursive: true,
-    mode: 0o700
-  });
-
-  state.profileDir = userDataDir;
-
-  browser = await chromium.launchPersistentContext(
-    userDataDir,
-    {
-      headless: env.HEADLESS === 'true',
-
-      ...(env.CHROME_CHANNEL
-        ? { channel: env.CHROME_CHANNEL }
-        : {}),
-
-      viewport: {
-        width: 1920,
-        height: 1080
-      },
-
-      screen: {
-        width: 1920,
-        height: 1080
-      },
-
-      locale: 'en-GB',
-
-      timezoneId: 'Europe/London',
-
-      acceptDownloads: false,
-
-      args: [
-        '--window-size=1920,1080',
-
-        ...(env.CHROMIUM_NO_SANDBOX === 'true'
-          ? [
-              '--no-sandbox',
-              '--disable-setuid-sandbox'
-            ]
-          : [])
-      ]
-    }
-  );
-
-  page =
-    browser.pages()[0] ||
-    await browser.newPage();
-
-  await page.exposeBinding(
-    '__nodeReceiverMessage',
-    (_, msg) => onPageMessage(msg)
-  );
-
-  // Chrome extension compatibility bridge
-  await browser.addInitScript(() => {
-    globalThis.chrome = {
-      runtime: {
-        id: 'node-receiver',
-
-        sendMessage: m =>
-          globalThis.__nodeReceiverMessage(m),
-
-        onMessage: {
-          addListener(cb) {
-            globalThis.__receiverAdapterListener = cb;
-          }
-        }
-      }
-    };
-  });
-
-  await navigate();
-
-  state.browser = 'running';
-
-  // Connect Oracle WebSocket receiver
-  worker = startSignalWorker({
-    config: {
-      endpoint:
-        env.ORACLE_WS_URL ||
-        'wss://145-241-233-33.sslip.io/v1/receivers/ws',
-
-      receiverId: id,
-
-      credential
-    },
-
-    persistSignal,
-
-    onStatus: s => {
-      state.socket = s.state;
-
-      if (s.error) {
-        state.socketError = s.error;
-      }
-    }
-  });
-
-  processNext();
 }
 
-// Start HTTP server
-server.listen(port, host, () => {
-  console.log(
-    `Receiver health http://${host}:${port}/health`
+function scheduleNext() {
+  if (stopping) return;
+
+  clearTimeout(timer);
+
+  state.nextPoll = new Date(
+    Date.now() + POLL_INTERVAL
+  ).toISOString();
+
+  timer = setTimeout(
+    pollDetector,
+    POLL_INTERVAL
   );
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(
+    req.url,
+    `http://${HOST}:${PORT}`
+  );
+
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'no-store');
+
+  if (
+    url.pathname === '/health' ||
+    url.pathname === '/status'
+  ) {
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      ...state,
+      pendingJobs: store.pending.length,
+      seenJobs: store.seen.length
+    }));
+    return;
+  }
+
+  if (url.pathname === '/jobs') {
+    const limit = Math.min(
+      500,
+      Math.max(
+        1,
+        Number(url.searchParams.get('limit') || 100)
+      )
+    );
+
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      total: store.pending.length,
+      jobs: store.pending.slice(-limit).reverse()
+    }));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({
+    error: 'Not found'
+  }));
 });
 
-main().catch(e => {
-  state.lastError = e.message;
-
-  console.error(e);
-  process.exitCode = 1;
+server.listen(PORT, HOST, () => {
+  log('receiver_started', {
+    host: HOST,
+    port: PORT,
+    detector: DETECTOR_URL
+  });
 });
 
-// Graceful shutdown
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, async () => {
-    worker?.stop();
-    save();
-    server.close();
+pollDetector();
 
-    await browser?.close();
+function shutdown() {
+  stopping = true;
+  clearTimeout(timer);
+  save();
 
+  server.close(() => {
     process.exit(0);
   });
 }
+
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
