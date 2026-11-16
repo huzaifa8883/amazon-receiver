@@ -1,4 +1,3 @@
-cat << 'EOF' > /var/www/amazon-bot-system/amazon-receiver/server.js
 import 'dotenv/config';
 import { WebSocketServer } from 'ws';
 import http from 'node:http';
@@ -207,4 +206,4 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, HOST, () => {
   log('receiver_started', { httpPort: PORT, wsPort: WS_PORT });
 });
-EOF
+
