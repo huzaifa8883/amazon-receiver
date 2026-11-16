@@ -1,7 +1,6 @@
-
+cat << 'EOF' > /var/www/amazon-bot-system/amazon-receiver/server.js
 import 'dotenv/config';
-
-import WebSocket from 'ws';
+import { WebSocketServer } from 'ws';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,41 +11,22 @@ const env = process.env;
 
 const PORT = Number(env.PORT || 5003);
 const HOST = env.BIND_HOST || '127.0.0.1';
-
-const DETECTOR_URL =
-  env.DETECTOR_URL || 'http://127.0.0.1:5002';
-
-const DETECTOR_WS_URL =
-  env.DETECTOR_WS_URL || 'ws://127.0.0.1:8080';
-
-const RECONNECT_MS = Number(env.RECONNECT_MS || 5000);
-const HEALTH_CHECK_MS = Number(env.HEALTH_CHECK_MS || 30000);
+const WS_PORT = Number(env.WS_PORT || 8082);
+const WS_TOKEN = env.WS_TOKEN || 'change-this-secret-token';
 const MAX_PENDING = Number(env.MAX_PENDING || 2000);
 
 const DATA_DIR = path.join(dir, '.runtime');
 const DATA_FILE = path.join(DATA_DIR, 'public-receiver.json');
 
-fs.mkdirSync(DATA_DIR, {
-  recursive: true,
-  mode: 0o700
-});
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
-let store = {
-  seen: [],
-  pending: [],
-  history: []
-};
+let store = { seen: [], pending: [], history: [] };
 
 try {
-  store = {
-    ...store,
-    ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'))
-  };
+  store = { ...store, ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) };
 } catch (error) {
   if (error.code !== 'ENOENT') {
-    throw new Error(
-      `Receiver state could not be loaded: ${error.message}`
-    );
+    throw new Error(`Receiver state could not be loaded: ${error.message}`);
   }
 }
 
@@ -55,21 +35,15 @@ const seen = new Set(store.seen.map(String));
 const state = {
   service: 'amazon-receiver',
   startedAt: new Date().toISOString(),
-  phase: 'starting',
-  socket: 'disconnected',
-  detector: 'unknown',
+  phase: 'waiting_for_local_detector',
+  socket: 'listening',
   lastEvent: null,
   lastJob: null,
   lastError: null,
-  lastHealthCheck: null,
   lastConnectedAt: null,
   receivedEvents: 0,
   newJobs: 0
 };
-
-let socket = null;
-let reconnectTimer = null;
-let stopping = false;
 
 function log(event, details = {}) {
   console.log(JSON.stringify({
@@ -82,15 +56,8 @@ function log(event, details = {}) {
 
 function save() {
   store.seen = [...seen];
-
   const temp = DATA_FILE + '.tmp';
-
-  fs.writeFileSync(
-    temp,
-    JSON.stringify(store, null, 2),
-    { mode: 0o600 }
-  );
-
+  fs.writeFileSync(temp, JSON.stringify(store, null, 2), { mode: 0o600 });
   fs.renameSync(temp, DATA_FILE);
 }
 
@@ -120,31 +87,22 @@ function matchesFilters(job) {
 
 function processJob(job) {
   const key = jobKey(job);
-
-  if (!key || !job.title) {
-    log('invalid_job_ignored');
-    return;
-  }
-
-  if (seen.has(key)) return;
+  if (!key || !job.title) return false;
+  if (seen.has(key)) return true; // Already seen, still ack
 
   const accepted = matchesFilters(job);
-
   if (accepted && store.pending.length >= MAX_PENDING) {
     state.lastError = 'Pending queue is full';
     log('queue_full', { jobId: key });
-    return;
+    return false;
   }
 
   seen.add(key);
 
   if (!accepted) {
-    log('job_filtered', {
-      jobId: key,
-      title: job.title
-    });
+    log('job_filtered', { jobId: key, title: job.title });
     save();
-    return;
+    return true;
   }
 
   const record = {
@@ -154,25 +112,12 @@ function processJob(job) {
   };
 
   store.pending.push(record);
-
-  store.history.push({
-    jobId: key,
-    event: 'NEW_UK_JOB',
-    timestamp: record.receivedAt
-  });
-
+  store.history.push({ jobId: key, event: 'NEW_UK_JOB', timestamp: record.receivedAt });
   store.history = store.history.slice(-5000);
-
-  // Save before announcing successful processing.
   save();
 
   state.newJobs++;
-
-  state.lastJob = {
-    jobId: job.jobId,
-    title: job.title,
-    location: job.location
-  };
+  state.lastJob = { jobId: job.jobId, title: job.title, location: job.location };
 
   log('new_job_received', {
     jobId: job.jobId,
@@ -180,169 +125,61 @@ function processJob(job) {
     location: job.location,
     pending: store.pending.length
   });
+
+  return true;
 }
 
-function handleMessage(data) {
-  let message;
+// WebSocket Server for Local Detector
+const wss = new WebSocketServer({ host: '0.0.0.0', port: WS_PORT });
 
-  try {
-    message = JSON.parse(data.toString());
-  } catch {
-    log('invalid_json_message');
+wss.on('connection', (ws, req) => {
+  const auth = req.headers['authorization'] || '';
+  if (auth !== `Bearer ${WS_TOKEN}`) {
+    log('unauthorized_connection_rejected', { ip: req.socket.remoteAddress });
+    ws.close(1008, 'Unauthorized');
     return;
   }
 
-  state.receivedEvents++;
-  state.lastEvent = new Date().toISOString();
+  state.socket = 'connected';
+  state.phase = 'monitoring';
+  state.lastConnectedAt = new Date().toISOString();
+  log('local_detector_connected', { ip: req.socket.remoteAddress });
 
-  if (message.event === 'DETECTOR_CONNECTED') {
-    log('detector_handshake_received');
-    return;
-  }
-
-  if (message.event !== 'NEW_UK_JOB') return;
-
-  try {
-    processJob(message.job);
-  } catch (error) {
-    state.lastError = error.message;
-
-    log('job_processing_failed', {
-      error: error.message
-    });
-  }
-}
-
-function scheduleReconnect() {
-  if (stopping || reconnectTimer) return;
-
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectDetector();
-  }, RECONNECT_MS);
-}
-
-function connectDetector() {
-  if (stopping) return;
-
-  if (socket &&
-      (socket.readyState === WebSocket.OPEN ||
-       socket.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
-
-  state.socket = 'connecting';
-
-  log('connecting', {
-    endpoint: DETECTOR_WS_URL
-  });
-
-  socket = new WebSocket(DETECTOR_WS_URL, {
-    handshakeTimeout: 10000,
-    maxPayload: 1024 * 1024
-  });
-
-  socket.on('open', () => {
-    state.socket = 'connected';
-    state.phase = 'monitoring';
-    state.lastConnectedAt = new Date().toISOString();
-    state.lastError = null;
-
-    log('websocket_connected');
-  });
-
-  socket.on('message', handleMessage);
-
-  socket.on('error', error => {
-    state.lastError = error.message;
-
-    log('websocket_error', {
-      error: error.message
-    });
-  });
-
-  socket.on('close', (code, reason) => {
-    state.socket = 'disconnected';
-    state.phase = 'waiting_for_detector';
-
-    log('websocket_closed', {
-      code,
-      reason: reason.toString()
-    });
-
-    socket = null;
-    scheduleReconnect();
-  });
-}
-
-async function fetchDetectorHealth() {
-  const controller = new AbortController();
-
-  const timeout = setTimeout(
-    () => controller.abort(),
-    10000
-  );
-
-  try {
-    const response = await fetch(
-      `${DETECTOR_URL.replace(/\/$/, '')}/health`,
-      {
-        signal: controller.signal,
-        headers: {
-          Accept: 'application/json'
-        }
-      }
-    );
-
-    const data = await response.json();
-
-    state.detector =
-      data.state ||
-      data.browser ||
-      'unknown';
-
-    state.lastHealthCheck =
-      new Date().toISOString();
-
-    if (data.paused) {
-      state.phase = 'paused_detector_restricted';
-    } else if (state.socket === 'connected') {
-      state.phase = 'monitoring';
+  ws.on('message', (data) => {
+    let message;
+    try {
+      message = JSON.parse(data.toString());
+    } catch {
+      log('invalid_json_message');
+      return;
     }
 
-    log('detector_health', {
-      httpStatus: response.status,
-      detectorState: state.detector,
-      paused: data.paused || false
-    });
+    state.receivedEvents++;
+    state.lastEvent = new Date().toISOString();
 
-  } catch (error) {
-    state.detector = 'unavailable';
+    if (message.event === 'NEW_UK_JOB' && message.job) {
+      const ok = processJob(message.job);
+      if (ok && message.job.jobId) {
+        ws.send(JSON.stringify({ event: 'JOB_ACK', jobId: message.job.jobId }));
+      }
+    }
+  });
 
-    log('detector_health_failed', {
-      error: error.message
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-}
+  ws.on('close', () => {
+    state.socket = 'listening';
+    state.phase = 'waiting_for_local_detector';
+    log('local_detector_disconnected');
+  });
+});
 
-// HTTP health/status API
+// HTTP health/status API (existing)
 const server = http.createServer((req, res) => {
-  const url = new URL(
-    req.url,
-    `http://${HOST}:${PORT}`
-  );
-
+  const url = new URL(req.url, `http://${HOST}:${PORT}`);
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Cache-Control', 'no-store');
 
-  if (
-    url.pathname === '/health' ||
-    url.pathname === '/status'
-  ) {
+  if (url.pathname === '/health' || url.pathname === '/status') {
     res.writeHead(200);
-
     res.end(JSON.stringify({
       ...state,
       pendingJobs: store.pending.length,
@@ -353,16 +190,9 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/jobs') {
-    const rawLimit = Number(
-      url.searchParams.get('limit') || 100
-    );
-
-    const limit = Number.isFinite(rawLimit)
-      ? Math.min(500, Math.max(1, Math.floor(rawLimit)))
-      : 100;
-
+    const rawLimit = Number(url.searchParams.get('limit') || 100);
+    const limit = Number.isFinite(rawLimit) ? Math.min(500, Math.max(1, Math.floor(rawLimit))) : 100;
     res.writeHead(200);
-
     res.end(JSON.stringify({
       total: store.pending.length,
       jobs: store.pending.slice(-limit).reverse()
@@ -375,41 +205,6 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  log('receiver_started', {
-    host: HOST,
-    port: PORT,
-    detector: DETECTOR_WS_URL
-  });
+  log('receiver_started', { httpPort: PORT, wsPort: WS_PORT });
 });
-
-connectDetector();
-
-void fetchDetectorHealth();
-
-const healthTimer = setInterval(() => {
-  void fetchDetectorHealth();
-}, HEALTH_CHECK_MS);
-
-async function shutdown() {
-  if (stopping) return;
-  stopping = true;
-
-  clearTimeout(reconnectTimer);
-  clearInterval(healthTimer);
-
-  if (socket) {
-    socket.removeAllListeners('close');
-    socket.terminate();
-    socket = null;
-  }
-
-  save();
-
-  server.close(() => {
-    process.exit(0);
-  });
-}
-
-process.once('SIGINT', shutdown);
-process.once('SIGTERM', shutdown);
-
+EOF
