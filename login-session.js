@@ -19,7 +19,7 @@ const PROFILE_DIR =
 const MAX_LOGIN_MINUTES = 15;
 
 function waitForEnterOrTimeout(minutes) {
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout
@@ -33,15 +33,15 @@ function waitForEnterOrTimeout(minutes) {
 
     function finish(reason) {
       if (finished) return;
-      finished = true;
 
+      finished = true;
       clearTimeout(timer);
       rl.close();
       resolve(reason);
     }
 
     rl.question(
-      '\nAfter logging in, press Enter to save and close.\n',
+      '\nOnce you finish logging in, press ENTER to save the session and close Chromium.\n',
       () => finish('enter')
     );
 
@@ -52,97 +52,115 @@ function waitForEnterOrTimeout(minutes) {
 }
 
 async function main() {
-  console.log('Amazon UK manual login');
-  console.log('Profile:', PROFILE_DIR);
+  console.log('====================================');
+  console.log(' Amazon UK - Manual Login Session');
+  console.log('====================================');
 
-  const context = await chromium.launchPersistentContext(
-    PROFILE_DIR,
-    {
-      headless: false,
-      args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage'
-  ]
-      viewport: {
-        width: 1366,
-        height: 768
-      },
-      locale: 'en-GB',
-      timezoneId: 'Europe/London',
-      acceptDownloads: false,
-      chromiumSandbox: true
-    }
-  );
+  console.log('Profile directory:', PROFILE_DIR);
+  console.log('Website:', HOME_URL);
+
+  let context;
 
   try {
+    context = await chromium.launchPersistentContext(
+      PROFILE_DIR,
+      {
+        headless: false,
+
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox'
+        ],
+
+        chromiumSandbox: false,
+
+        viewport: {
+          width: 1366,
+          height: 768
+        },
+
+        locale: 'en-GB',
+        timezoneId: 'Europe/London',
+        acceptDownloads: false
+      }
+    );
+
+    console.log('Chromium launched successfully.');
+
     const page =
       context.pages()[0] ||
       await context.newPage();
 
     page.setDefaultNavigationTimeout(45000);
 
-    console.log('Opening:', HOME_URL);
-
     try {
       const response = await page.goto(HOME_URL, {
-        waitUntil: 'domcontentloaded'
+        waitUntil: 'domcontentloaded',
+        timeout: 45000
       });
 
-      console.log(
-        'Initial HTTP status:',
-        response?.status() ?? 'unknown'
-      );
+      const httpStatus = response?.status() ?? null;
 
-      if ([403, 429].includes(response?.status())) {
+      console.log('Website HTTP status:', httpStatus);
+
+      if (httpStatus === 403 || httpStatus === 429) {
         console.warn(
-          'Access restricted by the website. ' +
-          'A saved profile will not override this restriction.'
+          'WARNING: Website access restricted. ' +
+          'The browser profile cannot override this restriction.'
         );
       }
     } catch (error) {
       console.warn(
-        'Navigation problem:',
+        'Navigation failed:',
         error.message
       );
 
       console.log(
-        'You can navigate manually in the open browser.'
+        'You may navigate manually inside the browser.'
       );
     }
 
-    console.log(`
-Complete the login manually in Chromium.
-
-- Enter your email or username.
-- Enter your password.
-- Complete any OTP or verification.
-- Confirm that the account is signed in.
-
-You have up to ${MAX_LOGIN_MINUTES} minutes.
-`);
+    console.log('\nManual login instructions:');
+    console.log('1. Sign in with your Amazon account.');
+    console.log('2. Complete any OTP or verification.');
+    console.log('3. Verify that you are logged in.');
+    console.log('4. Return to this terminal and press ENTER.');
+    console.log(`\nMaximum login time: ${MAX_LOGIN_MINUTES} minutes.`);
 
     const reason = await waitForEnterOrTimeout(
       MAX_LOGIN_MINUTES
     );
 
-    console.log('Closing browser:', reason);
+    console.log('Closing browser. Reason:', reason);
 
-    // Allow Chromium to flush outstanding cookie and
-    // profile data before the persistent context closes.
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(1000).catch(() => {});
+
+  } catch (error) {
+    console.error(
+      'Login session error:',
+      error.message
+    );
+
+    process.exitCode = 1;
 
   } finally {
-    await context.close();
+    if (context) {
+      await context.close().catch((error) => {
+        console.error(
+          'Failed to close Chromium:',
+          error.message
+        );
+      });
+    }
 
-    console.log(
-      'Browser closed. Persistent profile retained at:',
-      PROFILE_DIR
-    );
+    console.log('====================================');
+    console.log(' Browser closed');
+    console.log(' Profile location:', PROFILE_DIR);
+    console.log('====================================');
   }
 }
 
-main().catch(error => {
-  console.error('Login session failed:', error.message);
+main().catch((error) => {
+  console.error('Fatal error:', error.message);
   process.exitCode = 1;
 });
