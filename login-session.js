@@ -59,6 +59,11 @@ async function main() {
     PROFILE_DIR,
     {
       headless: false,
+      args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage'
+  ]
       viewport: {
         width: 1366,
         height: 768
